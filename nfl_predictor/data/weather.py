@@ -74,48 +74,72 @@ def _is_indoor(row: pd.Series) -> bool:
 
 
 def _open_meteo(lat: float, lon: float, kickoff: datetime, tz: str, archive: bool) -> dict[str, float] | None:
-    params = {
-        "latitude": f"{lat:.4f}",
-        "longitude": f"{lon:.4f}",
-        "hourly": "temperature_2m,precipitation,snowfall,wind_speed_10m",
-        "start_date": kickoff.strftime("%Y-%m-%d"),
-        "end_date": kickoff.strftime("%Y-%m-%d"),
-        "timezone": tz,
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "precipitation_unit": "inch",
-    }
-    base = ARCHIVE_URL if archive else FORECAST_URL
-    url = f"{base}?{urllib.parse.urlencode(params)}"
-    try:
-        with urllib.request.urlopen(url, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Weather fetch failed: %s", exc)
+    ahead = (kickoff.date() - datetime.now().date()).days
+    if not archive and ahead < -1:
+        archive = True
+    if not archive and ahead > 16:
         return None
 
-    hourly = payload.get("hourly") or {}
-    times = hourly.get("time") or []
-    if not times:
-        return None
-    target = kickoff.strftime("%Y-%m-%dT%H:00")
-    try:
-        idx = times.index(target)
-    except ValueError:
-        idx = min(range(len(times)), key=lambda i: abs(i - kickoff.hour))
+    param_sets = [
+        {
+            "hourly": "temperature_2m,precipitation,snowfall,wind_speed_10m",
+            "wind_speed_unit": "mph",
+        },
+        {
+            "hourly": "temperature_2m,precipitation,wind_speed_10m",
+            "wind_speed_unit": "mph",
+        },
+        {
+            "hourly": "temperature_2m,precipitation,windspeed_10m",
+            "windspeed_unit": "mph",
+        },
+    ]
+    last_error: Exception | None = None
+    for extra in param_sets:
+        params = {
+            "latitude": f"{lat:.4f}",
+            "longitude": f"{lon:.4f}",
+            "start_date": kickoff.strftime("%Y-%m-%d"),
+            "end_date": kickoff.strftime("%Y-%m-%d"),
+            "timezone": "auto",
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            **extra,
+        }
+        base = ARCHIVE_URL if archive else FORECAST_URL
+        url = f"{base}?{urllib.parse.urlencode(params)}"
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
 
-    def _at(key: str, fallback_key: str | None = None) -> float:
-        values = hourly.get(key) or (hourly.get(fallback_key) if fallback_key else None) or []
-        if not values or idx >= len(values) or values[idx] is None:
-            return float("nan")
-        return float(values[idx])
+        hourly = payload.get("hourly") or {}
+        times = hourly.get("time") or []
+        if not times:
+            continue
+        target = kickoff.strftime("%Y-%m-%dT%H:00")
+        try:
+            idx = times.index(target)
+        except ValueError:
+            idx = min(range(len(times)), key=lambda i: abs(i - kickoff.hour))
 
-    return {
-        "temp": _at("temperature_2m"),
-        "precip": _at("precipitation"),
-        "snowfall": _at("snowfall"),
-        "wind": _at("wind_speed_10m", "windspeed_10m"),
-    }
+        def _at(key: str, fallback_key: str | None = None) -> float:
+            values = hourly.get(key) or (hourly.get(fallback_key) if fallback_key else None) or []
+            if not values or idx >= len(values) or values[idx] is None:
+                return float("nan")
+            return float(values[idx])
+
+        return {
+            "temp": _at("temperature_2m"),
+            "precip": _at("precipitation"),
+            "snowfall": _at("snowfall"),
+            "wind": _at("wind_speed_10m", "windspeed_10m"),
+        }
+    if last_error is not None:
+        logger.warning("Weather fetch failed: %s", last_error)
+    return None
 
 
 def _weather_from_text(text: str) -> dict[str, bool]:

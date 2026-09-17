@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-from nfl_predictor.config import FORM_WINDOW, classify_style
+from nfl_predictor.config import (
+    FIRST_CURRENT_GAME_WEIGHT,
+    PREV_SEASON_BLEND_GAMES,
+    classify_style,
+)
 
 TEAM_STAT_COLS = [
     "off_epa",
@@ -33,6 +38,7 @@ def _team_game_rows(schedules: pd.DataFrame) -> pd.DataFrame:
             "is_home": 1,
             "points_for": schedules["home_score"],
             "points_against": schedules["away_score"],
+            "game_type": schedules["game_type"] if "game_type" in schedules.columns else "REG",
             "rest": schedules["home_rest"] if "home_rest" in schedules.columns else pd.NA,
         }
     )
@@ -47,6 +53,7 @@ def _team_game_rows(schedules: pd.DataFrame) -> pd.DataFrame:
             "is_home": 0,
             "points_for": schedules["away_score"],
             "points_against": schedules["home_score"],
+            "game_type": schedules["game_type"] if "game_type" in schedules.columns else "REG",
             "rest": schedules["away_rest"] if "away_rest" in schedules.columns else pd.NA,
         }
     )
@@ -55,60 +62,96 @@ def _team_game_rows(schedules: pd.DataFrame) -> pd.DataFrame:
 
 def _add_pbp_stats(team_games: pd.DataFrame, pbp_team_game: pd.DataFrame) -> pd.DataFrame:
     df = team_games.merge(pbp_team_game, on=["game_id", "season", "week", "team"], how="left")
-    pass_plays = df.get("off_pass_plays", 0).fillna(0)
-    rush_plays = df.get("off_rush_plays", 0).fillna(0)
+    pass_plays = pd.to_numeric(df["off_pass_plays"], errors="coerce") if "off_pass_plays" in df.columns else 0
+    rush_plays = pd.to_numeric(df["off_rush_plays"], errors="coerce") if "off_rush_plays" in df.columns else 0
+    if not isinstance(pass_plays, pd.Series):
+        pass_plays = pd.Series(0, index=df.index, dtype="float64")
+    if not isinstance(rush_plays, pd.Series):
+        rush_plays = pd.Series(0, index=df.index, dtype="float64")
+    pass_plays = pass_plays.fillna(0)
+    rush_plays = rush_plays.fillna(0)
     total = pass_plays + rush_plays
-    df["rush_rate"] = (rush_plays / total.replace(0, pd.NA)).astype(float)
-    df["point_diff"] = df["points_for"] - df["points_against"]
+    df["rush_rate"] = (rush_plays / total.mask(total == 0)).astype("float64")
+    df["point_diff"] = pd.to_numeric(df["points_for"], errors="coerce") - pd.to_numeric(
+        df["points_against"], errors="coerce"
+    )
     return df
 
 
-def _expanding_prior(series: pd.Series) -> pd.Series:
-    return series.shift(1).expanding(min_periods=1).mean()
+def _prev_season_keep(n_current: int) -> int:
+    """How many late prior-season REG games to mix in given current-season sample size."""
+    return max(0, PREV_SEASON_BLEND_GAMES - max(0, n_current - 1))
+
+
+def _weighted_mean(values: pd.Series, weights: np.ndarray) -> float:
+    vals = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(vals) & np.isfinite(w) & (w > 0)
+    if not mask.any():
+        return float("nan")
+    return float(np.average(vals[mask], weights=w[mask]))
+
+
+def _priors_for_team(group: pd.DataFrame) -> pd.DataFrame:
+    g = group.sort_values(["season", "week", "gameday"]).reset_index(drop=True)
+    if "game_type" not in g.columns:
+        g["game_type"] = "REG"
+    for col in TEAM_STAT_COLS:
+        if col not in g.columns:
+            g[col] = np.nan
+
+    records: list[dict] = []
+    for i in range(len(g)):
+        season = g.at[i, "season"]
+        past = g.iloc[:i]
+        past = past[past["points_for"].notna()]
+        current = past[past["season"] == season]
+        n_curr = len(current)
+        n_prev = _prev_season_keep(n_curr)
+        previous = past[(past["season"] == season - 1) & (past["game_type"].fillna("REG") == "REG")]
+        previous = previous.sort_values(["week", "gameday"]).tail(n_prev)
+
+        pieces: list[pd.DataFrame] = []
+        weights: list[float] = []
+        if not previous.empty:
+            pieces.append(previous)
+            weights.extend([1.0] * len(previous))
+        if n_curr == 1:
+            pieces.append(current)
+            weights.append(FIRST_CURRENT_GAME_WEIGHT)
+        elif n_curr > 1:
+            pieces.append(current)
+            weights.extend([1.0] * n_curr)
+
+        row_priors = {f"prior_{col}": np.nan for col in TEAM_STAT_COLS}
+        row_priors["prior_form_pd"] = np.nan
+        row_priors["prior_home_pd"] = np.nan
+        row_priors["prior_away_pd"] = np.nan
+        row_priors["prior_games"] = float(sum(weights)) if weights else 0.0
+
+        if pieces:
+            window = pd.concat(pieces, ignore_index=True)
+            w = np.array(weights, dtype=float)
+            for col in TEAM_STAT_COLS:
+                row_priors[f"prior_{col}"] = _weighted_mean(window[col], w)
+            row_priors["prior_form_pd"] = _weighted_mean(window["point_diff"], w)
+            home_mask = window["is_home"].to_numpy() == 1
+            away_mask = ~home_mask
+            if home_mask.any():
+                row_priors["prior_home_pd"] = _weighted_mean(window.loc[home_mask, "point_diff"], w[home_mask])
+            if away_mask.any():
+                row_priors["prior_away_pd"] = _weighted_mean(window.loc[away_mask, "point_diff"], w[away_mask])
+        records.append(row_priors)
+
+    return pd.concat([g, pd.DataFrame(records)], axis=1)
 
 
 def _add_rolling_priors(team_games: pd.DataFrame) -> pd.DataFrame:
     df = team_games.sort_values(["team", "season", "week", "gameday"]).copy()
     df["season"] = pd.to_numeric(df["season"], errors="coerce")
     df["week"] = pd.to_numeric(df["week"], errors="coerce")
-
-    grouped = df.groupby(["team", "season"], group_keys=False)
-    for col in TEAM_STAT_COLS:
-        if col not in df.columns:
-            df[col] = pd.NA
-        df[f"roll_{col}"] = grouped[col].transform(_expanding_prior)
-
-    df["roll_form_pd"] = grouped["point_diff"].transform(
-        lambda s: s.shift(1).rolling(FORM_WINDOW, min_periods=1).mean()
-    )
-    df["roll_prior_games"] = grouped["points_for"].transform(lambda s: s.shift(1).expanding().count())
-
-    home_only = df[df["is_home"] == 1].copy()
-    away_only = df[df["is_home"] == 0].copy()
-    home_only["roll_home_pd"] = home_only.groupby(["team", "season"], group_keys=False)["point_diff"].transform(
-        _expanding_prior
-    )
-    away_only["roll_away_pd"] = away_only.groupby(["team", "season"], group_keys=False)["point_diff"].transform(
-        _expanding_prior
-    )
-    df = df.merge(home_only[["game_id", "team", "roll_home_pd"]], on=["game_id", "team"], how="left")
-    df = df.merge(away_only[["game_id", "team", "roll_away_pd"]], on=["game_id", "team"], how="left")
-
-    prev = (
-        df.groupby(["team", "season"], as_index=False)[TEAM_STAT_COLS]
-        .mean(numeric_only=True)
-        .rename(columns={c: f"prev_{c}" for c in TEAM_STAT_COLS})
-    )
-    prev["season"] = prev["season"] + 1
-    df = df.merge(prev, on=["team", "season"], how="left")
-
-    for col in TEAM_STAT_COLS:
-        df[f"prior_{col}"] = df[f"roll_{col}"].fillna(df[f"prev_{col}"])
-    df["prior_form_pd"] = df["roll_form_pd"].fillna(df["prior_point_diff"])
-    df["prior_home_pd"] = df["roll_home_pd"].fillna(df["prior_point_diff"])
-    df["prior_away_pd"] = df["roll_away_pd"].fillna(df["prior_point_diff"])
-    df["prior_games"] = df["roll_prior_games"].fillna(0)
-
+    parts = [_priors_for_team(group) for _, group in df.groupby("team", sort=False)]
+    df = pd.concat(parts, ignore_index=True)
     league_rush = df["prior_rush_rate"].mean(skipna=True)
     df["style"] = df["prior_rush_rate"].apply(
         lambda x: classify_style(float(x), league_rush) if pd.notna(x) else "balanced"

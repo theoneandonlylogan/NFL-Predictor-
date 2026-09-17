@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from nfl_predictor import numpy_compat as _numpy_compat  # noqa: F401
 from nfl_predictor.config import FEATURE_LABELS, current_nfl_season
 from nfl_predictor.models.train import ensure_model
 

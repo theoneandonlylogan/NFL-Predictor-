@@ -12,6 +12,10 @@ ARTIFACTS = PROJECT_ROOT / "artifacts"
 FIRST_SEASON = 2018
 MIN_TRAIN_GAMES = 200
 FORM_WINDOW = 4
+# Week 2: last 5 prior-season REG games + downweighted week 1.
+# Each later week drops one prior-season game until current season stands alone.
+PREV_SEASON_BLEND_GAMES = 5
+FIRST_CURRENT_GAME_WEIGHT = 0.75
 STARTER_SNAP_PCT = 50.0
 STARTER_LOOKBACK_WEEKS = 3
 LIVE_CACHE_HOURS = 12
@@ -160,8 +164,8 @@ FEATURE_LABELS = {
     "pass_edge_net": "Net pass matchup edge (home)",
     "home_home_pd": "Home team home-field point diff",
     "away_away_pd": "Away team road point diff",
-    "home_form_pd": "Home last-4 point diff",
-    "away_form_pd": "Away last-4 point diff",
+    "home_form_pd": "Home blended form point diff",
+    "away_form_pd": "Away blended form point diff",
     "home_injury_penalty": "Home injury penalty",
     "away_injury_penalty": "Away injury penalty",
     "home_qb_out": "Home QB out/doubtful",

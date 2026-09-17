@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 NFLVERSE_RELEASE = "https://github.com/nflverse/nflverse-data/releases/download"
 USER_AGENT = "nfl-predictor/1.0 (https://github.com/theoneandonlylogan/NFL-Predictor-)"
+_PARQUET_ENGINE: bool | None = None
 
 
 def _ensure_raw_dir() -> Path:
@@ -22,8 +23,29 @@ def _ensure_raw_dir() -> Path:
     return DATA_RAW
 
 
+def _parquet_engine_available() -> bool:
+    global _PARQUET_ENGINE
+    if _PARQUET_ENGINE is not None:
+        return _PARQUET_ENGINE
+    try:
+        pd.io.parquet.get_engine("auto")
+        _PARQUET_ENGINE = True
+    except Exception:
+        _PARQUET_ENGINE = False
+        logger.info("No parquet engine (pyarrow/fastparquet); using CSV/pickle.")
+    return _PARQUET_ENGINE
+
+
+def _csv_filename(parquet_name: str) -> str:
+    stem = parquet_name.removesuffix(".parquet")
+    if stem.startswith("play_by_play"):
+        return f"{stem}.csv.gz"
+    return f"{stem}.csv"
+
+
 def _cache_path(name: str, year: int) -> Path:
-    return _ensure_raw_dir() / f"{name}_{year}.parquet"
+    ext = "parquet" if _parquet_engine_available() else "pkl"
+    return _ensure_raw_dir() / f"{name}_{year}.{ext}"
 
 
 def _is_live_year(year: int) -> bool:
@@ -39,10 +61,23 @@ def _cache_fresh(path: Path, year: int) -> bool:
     return age_hours < LIVE_CACHE_HOURS
 
 
+def _read_cache(path: Path) -> pd.DataFrame:
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_pickle(path)
+
+
+def _write_cache(df: pd.DataFrame, path: Path) -> None:
+    if path.suffix == ".parquet":
+        df.to_parquet(path, index=False)
+    else:
+        df.to_pickle(path)
+
+
 def _read_or_fetch(name: str, year: int, fetch, refresh: bool = False) -> pd.DataFrame:
     path = _cache_path(name, year)
     if not refresh and _cache_fresh(path, year):
-        return pd.read_parquet(path)
+        return _read_cache(path)
     logger.info("Fetching %s %s", name, year)
     df = fetch(year)
     if df is None:
@@ -50,7 +85,7 @@ def _read_or_fetch(name: str, year: int, fetch, refresh: bool = False) -> pd.Dat
     if df.empty and not _is_live_year(year):
         logger.warning("No %s data for %s; not caching empty historical file", name, year)
         return df
-    df.to_parquet(path, index=False)
+    _write_cache(df, path)
     return df
 
 
@@ -62,39 +97,52 @@ def _concat_years(name: str, years: list[int], fetch, refresh: bool = False) -> 
     return pd.concat(frames, ignore_index=True)
 
 
-def _download_parquet(url: str) -> pd.DataFrame:
+def _download(url: str) -> Path:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=180) as resp:
         data = resp.read()
     tmp = _ensure_raw_dir() / f"_download_{url.split('/')[-1]}.tmp"
     tmp.write_bytes(data)
+    return tmp
+
+
+def _read_downloaded(path: Path, url: str) -> pd.DataFrame:
+    lower = url.lower()
+    if lower.endswith(".parquet"):
+        return pd.read_parquet(path)
+    if lower.endswith(".csv.gz") or lower.endswith(".gz"):
+        return pd.read_csv(path, compression="gzip", low_memory=False)
+    return pd.read_csv(path, low_memory=False)
+
+
+def _nflverse_file(release: str, filename: str) -> pd.DataFrame:
+    if not _parquet_engine_available():
+        filename = _csv_filename(filename)
+    url = f"{NFLVERSE_RELEASE}/{release}/{filename}"
+    print(f"Downloading {filename} ...")
+    logger.info("GET %s", url)
+    tmp = _download(url)
     try:
-        return pd.read_parquet(tmp)
+        return _read_downloaded(tmp, url)
     finally:
         tmp.unlink(missing_ok=True)
 
 
-def _nflverse_file(release: str, filename: str) -> pd.DataFrame:
-    url = f"{NFLVERSE_RELEASE}/{release}/{filename}"
-    print(f"Downloading {filename} ...")
-    logger.info("GET %s", url)
-    return _download_parquet(url)
-
-
 def _cached_asset(cache_name: str, release: str, filename: str, refresh: bool, live: bool) -> pd.DataFrame:
-    path = _ensure_raw_dir() / f"{cache_name}.parquet"
+    ext = "parquet" if _parquet_engine_available() else "pkl"
+    path = _ensure_raw_dir() / f"{cache_name}.{ext}"
     if not refresh and path.exists():
         if not live:
-            return pd.read_parquet(path)
+            return _read_cache(path)
         age_hours = (time.time() - path.stat().st_mtime) / 3600
         if age_hours < LIVE_CACHE_HOURS:
-            return pd.read_parquet(path)
+            return _read_cache(path)
     df = _nflverse_file(release, filename)
     if df.empty:
         if path.exists():
-            return pd.read_parquet(path)
+            return _read_cache(path)
         return df
-    df.to_parquet(path, index=False)
+    _write_cache(df, path)
     return df
 
 
@@ -187,6 +235,7 @@ def load_team_game_pbp(years: list[int], refresh: bool = False) -> pd.DataFrame:
             return _aggregate_team_game_pbp(pbp)
         except Exception as exc:  # noqa: BLE001 - in-progress seasons can 404
             logger.warning("Play-by-play unavailable for %s: %s", year, exc)
+            print(f"Play-by-play unavailable for {year}: {exc}")
             return pd.DataFrame()
 
     return _concat_years("pbp_team_game", years, fetch, refresh=refresh)

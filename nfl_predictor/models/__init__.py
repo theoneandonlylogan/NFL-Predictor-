@@ -1,3 +1,4 @@
+from nfl_predictor import numpy_compat as _numpy_compat  # noqa: F401
 from nfl_predictor.models.predict import default_week, explain_row, predict_week
 from nfl_predictor.models.train import ensure_model, rolling_backtest, train_final_model
 

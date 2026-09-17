@@ -8,6 +8,9 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+
+from nfl_predictor import numpy_compat as _numpy_compat  # noqa: F401  # patch RNG before sklearn
+
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
